@@ -1,0 +1,26 @@
+[package]
+name = "megaquarry-cli"
+description = "megaquarry command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "megaquarry"
+path = "src/main.rs"
+
+[dependencies]
+megaquarry-core.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+dirs.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-util.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+serde_json.workspace = true
+megaquarry-core.workspace = true
