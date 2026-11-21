@@ -13,6 +13,8 @@ use megaquarry_core::egress::{
 use megaquarry_core::session::{self, LoginError, Session};
 use megaquarry_core::store::{Settings, Store, TransferLock, Vault};
 
+use crate::output::Reporter;
+
 pub type Api = MegaApi<ReqwestTransport>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -20,9 +22,43 @@ pub const ACCOUNT_PASSWORD_ENV: &str = "MEGAQUARRY_PASSWORD";
 pub const MASTER_PASSWORD_ENV: &str = "MEGAQUARRY_MASTER_PASSWORD";
 pub const NEW_MASTER_PASSWORD_ENV: &str = "MEGAQUARRY_NEW_MASTER_PASSWORD";
 
+/// Process exit codes (documented in `--help` and the README).
+pub mod exit {
+    pub const ERROR: u8 = 1;
+    pub const USAGE: u8 = 2;
+    pub const BUSY: u8 = 3;
+    pub const PARTIAL: u8 = 4;
+    pub const INTERRUPTED: u8 = 130;
+}
+
+/// An error that ends the process with a specific exit code.
+#[derive(Debug)]
+pub struct Failure {
+    pub code: u8,
+    pub message: String,
+}
+
+impl Failure {
+    pub fn error(code: u8, message: impl Into<String>) -> Error {
+        Box::new(Self {
+            code,
+            message: message.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
 pub struct Context {
     pub store: Arc<Store>,
     pub settings: Settings,
+    pub reporter: Reporter,
     api_url: Option<String>,
     home: PathBuf,
     egress: Egress,
@@ -40,6 +76,7 @@ impl Context {
         home: Option<PathBuf>,
         api_url: Option<String>,
         egress: Egress,
+        reporter: Reporter,
     ) -> Result<Self, Error> {
         let home = match home {
             Some(home) => home,
@@ -48,10 +85,16 @@ impl Context {
                 .join("megaquarry"),
         };
         let store = Store::open(&home.join("megaquarry.db"))?;
-        let settings = Settings::load(&store)?;
+        let (settings, warnings) = Settings::load_with_warnings(&store)?;
+        for warning in warnings {
+            reporter.warn(format!(
+                "warning: {warning} (fix it with `megaquarry config set`)"
+            ));
+        }
         Ok(Self {
             store: Arc::new(store),
             settings,
+            reporter,
             api_url,
             home,
             egress,
@@ -62,11 +105,13 @@ impl Context {
     pub fn transfer_lock(&self) -> Result<TransferLock, Error> {
         let path = self.home.join("transfer.lock");
         TransferLock::try_acquire(&path)?.ok_or_else(|| {
-            format!(
-                "another megaquarry transfer is running (lock: {}); wait for it to finish",
-                path.display()
+            Failure::error(
+                exit::BUSY,
+                format!(
+                    "another megaquarry transfer is running (lock: {}); wait for it to finish",
+                    path.display()
+                ),
             )
-            .into()
         })
     }
 
@@ -81,8 +126,8 @@ impl Context {
             return Ok(None);
         };
         if through_account {
-            eprintln!(
-                "warning: downloads through an account do not rotate the exit IP (MEGA counts their quota per account)"
+            self.reporter.warn(
+                "warning: downloads through an account do not rotate the exit IP (MEGA counts their quota per account)",
             );
             return Ok(None);
         }
@@ -99,7 +144,11 @@ impl Context {
             .trim()
             .to_owned();
         if key.is_empty() {
-            return Err(format!("the API key file {} is empty", key_file.display()).into());
+            return Err(format!(
+                "the API key file {} is empty; put the gluetun control API key in it (see the README)",
+                key_file.display()
+            )
+            .into());
         }
         let control = GluetunControl::new(url, key)?;
         let protected = control.requires_auth().await.map_err(|e| {
@@ -114,9 +163,13 @@ impl Context {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter = self.reporter.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                eprintln!("{}", describe(&event));
+                match event {
+                    RotationEvent::Unavailable { .. } => reporter.warn(describe(&event)),
+                    _ => reporter.status(describe(&event)),
+                }
             }
         });
         let settings = &self.settings;
@@ -132,7 +185,9 @@ impl Context {
         )
         .with_events(tx);
         match rotator.prepare().await {
-            Ok(ip) => eprintln!("downloading through exit IP {ip}"),
+            Ok(ip) => self
+                .reporter
+                .status(format!("downloading through exit IP {ip}")),
             // Downloads will wait for an IP to rest enough.
             Err(RotateError::Exhausted) => {}
             Err(e) => {
@@ -142,6 +197,23 @@ impl Context {
             }
         }
         Ok(Some(Arc::new(rotator)))
+    }
+
+    /// The account to upload to: the one given, or the only stored one.
+    pub fn upload_account(&self, account: Option<String>) -> Result<String, Error> {
+        if let Some(account) = account {
+            return Ok(account);
+        }
+        let mut emails = self.store.account_emails()?;
+        match emails.len() {
+            0 => Err("no stored account: run `megaquarry login EMAIL` first".into()),
+            1 => Ok(emails.remove(0)),
+            _ => Err(format!(
+                "several accounts are stored ({}): pass --account EMAIL",
+                emails.join(", ")
+            )
+            .into()),
+        }
     }
 
     pub fn api(&self) -> Result<Arc<Api>, Error> {
@@ -187,7 +259,11 @@ impl Context {
             .ok_or_else(|| format!("no stored account {email}: run `megaquarry login {email}`"))?;
         let session = match session::login_with_credentials(api, &credentials, None).await {
             Err(LoginError::MfaRequired) => {
-                let code = prompt("Two-factor code: ")?;
+                let code = prompt("Two-factor code: ").map_err(|_| {
+                    format!(
+                        "{email} needs a two-factor code: run `megaquarry login {email} --mfa CODE` again"
+                    )
+                })?;
                 session::login_with_credentials(api, &credentials, Some(&code)).await?
             }
             other => other?,

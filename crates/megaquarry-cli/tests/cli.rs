@@ -288,9 +288,9 @@ fn lists_and_downloads_a_folder_through_the_queue() {
         .unwrap();
     assert!(listing.status.success(), "{}", stderr(&listing));
     let text = stdout(&listing);
-    assert!(text.contains("1000  Shared/a.txt"), "{text}");
-    assert!(text.contains("5000  Shared/Sub/b.bin"), "{text}");
-    assert!(text.contains("2 file(s), 6000 bytes"));
+    assert!(text.contains("1000 B  Shared/a.txt"), "{text}");
+    assert!(text.contains("4.9 KiB  Shared/Sub/b.bin"), "{text}");
+    assert!(text.contains("2 file(s), 5.9 KiB"), "{text}");
 
     let queued = cli(home.path(), &fake)
         .args(["download", "--no-start", &fake.folder_link(), "-o"])
@@ -375,7 +375,7 @@ fn manages_settings() {
             .unwrap(),
     );
     assert!(list.contains("max_downloads = 2    #"));
-    assert!(list.contains("verify_down_file = yes (default)"));
+    assert!(list.contains("verify_downloads = yes (default)"));
     cli(home.path(), &fake)
         .args(["config", "unset", "max_downloads"])
         .assert()
@@ -390,8 +390,97 @@ fn manages_settings() {
         .args(["config", "set", "nope", "1"])
         .output()
         .unwrap();
-    assert!(!unknown.status.success());
+    assert_eq!(unknown.status.code(), Some(2));
     assert!(stderr(&unknown).contains("unknown setting `nope`"));
+
+    for (key, value, message) in [
+        (
+            "max_downloads",
+            "abc",
+            r#"max_downloads must be a number from 1 to 50 (got "abc")"#,
+        ),
+        (
+            "verify_downloads",
+            "true",
+            r#"verify_downloads must be yes or no (got "true")"#,
+        ),
+    ] {
+        let invalid = cli(home.path(), &fake)
+            .args(["config", "set", key, value])
+            .output()
+            .unwrap();
+        assert_eq!(invalid.status.code(), Some(2), "{}", stderr(&invalid));
+        assert!(stderr(&invalid).contains(message), "{}", stderr(&invalid));
+    }
+    let value = cli(home.path(), &fake)
+        .args(["config", "get", "verify_downloads"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        stdout(&value).trim(),
+        "yes",
+        "rejected values are not stored"
+    );
+}
+
+#[test]
+fn warns_about_bad_stored_settings() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    megaquarry_core::store::Store::open(&home.path().join("megaquarry.db"))
+        .unwrap()
+        .set_setting("max_downloads", "abc")
+        .unwrap();
+    let output = cli(home.path(), &fake)
+        .args(["config", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        stderr(&output).contains(
+            r#"warning: max_downloads must be a number from 1 to 50 (got "abc"); using 4"#
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn settings_as_json() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    cli(home.path(), &fake)
+        .args(["config", "set", "max_downloads", "2"])
+        .assert()
+        .success();
+    let list: Value = serde_json::from_str(&stdout(
+        &cli(home.path(), &fake)
+            .args(["config", "list", "--json"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    let settings = list["settings"].as_array().unwrap();
+    assert_eq!(settings.len(), 14);
+    assert_eq!(
+        settings[2],
+        json!({
+            "key": "max_downloads",
+            "value": "2",
+            "default": "4",
+            "is_default": false,
+            "description": "downloads running at once",
+        })
+    );
+    let one: Value = serde_json::from_str(&stdout(
+        &cli(home.path(), &fake)
+            .args(["config", "get", "verify_downloads", "--json"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(one["value"], "yes");
+    assert_eq!(one["is_default"], true);
 }
 
 #[test]
@@ -436,9 +525,20 @@ fn logs_in_and_protects_accounts_with_a_master_password() {
     assert!(stderr(&wrong).contains("wrong master password"));
     cli(home.path(), &fake)
         .env("MEGAQUARRY_MASTER_PASSWORD", "s3cret")
-        .args(["master-password", "remove"])
+        .args(["master-password", "remove", "--yes"])
         .assert()
         .success();
+    let accounts: Value = serde_json::from_str(&stdout(
+        &cli(home.path(), &fake)
+            .args(["accounts", "--json"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        accounts,
+        json!({"accounts": [{"email": "user@example.com"}]})
+    );
 
     let wrong_password = cli(home.path(), &start(None))
         .env("MEGAQUARRY_PASSWORD", "bad")
@@ -490,7 +590,7 @@ fn uploads_a_directory_tree() {
     std::fs::write(tree.join("2024/b.jpg"), vec![2u8; 3000]).unwrap();
 
     let output = cli(home.path(), &fake)
-        .args(["upload", "--account", "user@example.com"])
+        .args(["upload", "--account", "user@example.com", "--public-link"])
         .arg(&tree)
         .output()
         .unwrap();
@@ -513,6 +613,79 @@ fn uploads_a_directory_tree() {
         .filter(|c| c["a"] == "p" && c["n"][0]["t"] == 0)
         .count();
     assert_eq!(files, 2);
+}
+
+#[test]
+fn uploads_are_private_by_default_and_use_the_only_account() {
+    let fake = login_fake();
+    let home = tempfile::tempdir().unwrap();
+    login(home.path(), &fake);
+    let file = home.path().join("notes.txt");
+    std::fs::write(&file, b"hello").unwrap();
+
+    let output = cli(home.path(), &fake)
+        .arg("upload")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("1 completed"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!stdout(&output).contains("https://mega.nz/file/"));
+    let exports = fake
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c["a"] == "l")
+        .count();
+    assert_eq!(exports, 0, "no public link was created");
+}
+
+#[test]
+fn a_queued_upload_keeps_its_public_link_choice() {
+    let fake = login_fake();
+    let home = tempfile::tempdir().unwrap();
+    login(home.path(), &fake);
+    let file = home.path().join("notes.txt");
+    std::fs::write(&file, b"hello").unwrap();
+    cli(home.path(), &fake)
+        .args(["upload", "--no-start", "--public-link"])
+        .arg(&file)
+        .assert()
+        .success();
+    let output = cli(home.path(), &fake)
+        .args(["queue", "run", "--account", "user@example.com"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("https://mega.nz/file/PUBLIC#"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn uploading_without_an_account_says_how_to_add_one() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join("notes.txt");
+    std::fs::write(&file, b"hello").unwrap();
+    let output = cli(home.path(), &fake)
+        .arg("upload")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("no stored account: run `megaquarry login EMAIL` first"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -727,15 +900,10 @@ fn downloads_through_an_account_do_not_rotate() {
     let gluetun = gluetun(&fake, "1.1.1.1", &["2.2.2.2"]);
     let home = tempfile::tempdir().unwrap();
     login(home.path(), &fake);
-    for (key, value) in [
-        ("use_mega_account_down", "yes"),
-        ("mega_account_down", "user@example.com"),
-    ] {
-        cli(home.path(), &fake)
-            .args(["config", "set", key, value])
-            .assert()
-            .success();
-    }
+    cli(home.path(), &fake)
+        .args(["config", "set", "download_account", "user@example.com"])
+        .assert()
+        .success();
 
     let output = rotating_cli(home.path(), &fake, &gluetun)
         .args(["download", &fake.file_link("SINGLE"), "-o"])
@@ -765,7 +933,7 @@ fn only_one_transfer_runs_at_a_time() {
         .args(["download", &fake.file_link("SINGLE")])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(3));
     assert!(
         stderr(&output).contains("another megaquarry transfer is running"),
         "{}",
@@ -784,7 +952,7 @@ fn only_one_transfer_runs_at_a_time() {
         .args(["queue", "run"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(3));
 
     // Commands that do not transfer keep working.
     cli(home.path(), &fake)
@@ -808,12 +976,246 @@ fn only_one_transfer_runs_at_a_time() {
 
 #[test]
 fn help_documents_the_rotation_options() {
+    for command in [["download", "--help"], ["queue", "run"]] {
+        let mut args: Vec<&str> = command.to_vec();
+        if args[0] == "queue" {
+            args.push("--help");
+        }
+        let output = Command::cargo_bin("megaquarry")
+            .unwrap()
+            .args(&args)
+            .output()
+            .unwrap();
+        let help = stdout(&output);
+        assert!(help.contains("--egress-url"), "{help}");
+        assert!(help.contains("--egress-key-file"), "{help}");
+    }
     let output = Command::cargo_bin("megaquarry")
         .unwrap()
-        .arg("--help")
+        .args(["login", "--help"])
         .output()
         .unwrap();
-    let help = stdout(&output);
-    assert!(help.contains("--egress-url"), "{help}");
-    assert!(help.contains("--egress-key-file"), "{help}");
+    assert!(
+        !stdout(&output).contains("--egress-url"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+fn help(args: &[&str]) -> String {
+    let output = Command::cargo_bin("megaquarry")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output)
+}
+
+#[test]
+fn help_describes_the_tool_with_examples_and_exit_codes() {
+    let top = help(&["--help"]);
+    assert!(
+        top.contains("Download and upload MEGA files from the command line."),
+        "{top}"
+    );
+    assert!(top.contains("Exit codes:"), "{top}");
+    assert!(top.contains("another transfer is already running"), "{top}");
+    for command in [
+        &["download", "--help"][..],
+        &["ls", "--help"],
+        &["upload", "--help"],
+        &["queue", "--help"],
+    ] {
+        let text = help(command);
+        assert!(text.contains("Examples:"), "{command:?}: {text}");
+        assert!(text.contains("megaquarry "), "{command:?}: {text}");
+    }
+}
+
+#[test]
+fn unknown_queue_entries_are_named() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    for action in ["pause", "resume", "remove"] {
+        let output = cli(home.path(), &fake)
+            .args(["queue", action, "99999"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains("no queue entry 99999 (see `megaquarry queue list`)"),
+            "{action}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn a_run_with_failed_transfers_exits_with_4() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    let out = home.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("report.pdf"), b"already here").unwrap();
+    let output = cli(home.path(), &fake)
+        .args(["download", &fake.file_link("SINGLE"), "-o"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("0 completed, 1 failed"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn bad_usage_exits_with_2() {
+    let output = Command::cargo_bin("megaquarry")
+        .unwrap()
+        .args(["download"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn quiet_hides_progress_but_keeps_results() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    let output = cli(home.path(), &fake)
+        .args(["-q", "download", &fake.file_link("SINGLE"), "-o"])
+        .arg(home.path().join("out"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("queued 1 file(s)"));
+    assert!(stdout(&output).contains("1 completed, 0 failed"));
+}
+
+#[test]
+fn progress_is_quiet_when_stderr_is_not_a_terminal() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    let output = cli(home.path(), &fake)
+        .args(["download", &fake.file_link("SINGLE"), "-o"])
+        .arg(home.path().join("out"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(err.contains("started download"), "{err}");
+    assert!(!err.contains('%'), "no percentage lines in logs: {err}");
+}
+
+#[test]
+fn links_and_the_queue_as_json() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    let listing: Value = serde_json::from_str(&stdout(
+        &cli(home.path(), &fake)
+            .args(["ls", "--json", &fake.folder_link()])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(listing["count"], 2);
+    assert_eq!(listing["total_size"], 6000);
+    let paths: Vec<&str> = listing["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["Shared/a.txt", "Shared/Sub/b.bin"]);
+    assert_eq!(listing["files"][0]["name"], "a.txt");
+    assert_eq!(listing["files"][0]["size"], 1000);
+    assert!(
+        listing["files"][0]["link"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://mega.nz/")
+    );
+
+    cli(home.path(), &fake)
+        .args(["download", "--no-start", &fake.folder_link(), "-o"])
+        .arg(home.path().join("out"))
+        .assert()
+        .success();
+    let queue: Value = serde_json::from_str(&stdout(
+        &cli(home.path(), &fake)
+            .args(["queue", "list", "--json"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    let entries = queue["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0]["id"].is_i64());
+    assert_eq!(entries[0]["kind"], "download");
+    assert_eq!(entries[0]["state"], "queued");
+    assert_eq!(entries[0]["error"], Value::Null);
+    assert!(entries[0]["target"].as_str().unwrap().ends_with("a.txt"));
+}
+
+#[test]
+fn prints_shell_completions_without_a_data_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let never = home.path().join("never");
+    for (shell, marker) in [
+        ("bash", "_megaquarry"),
+        ("zsh", "#compdef megaquarry"),
+        ("fish", "complete -c megaquarry"),
+    ] {
+        let output = Command::cargo_bin("megaquarry")
+            .unwrap()
+            .env("MEGAQUARRY_HOME", &never)
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains(marker), "{shell}");
+    }
+    assert!(!never.exists());
+}
+
+#[test]
+fn queue_list_keeps_its_aligned_columns() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    megaquarry_core::store::Store::open(&home.path().join("megaquarry.db"))
+        .unwrap()
+        .enqueue(
+            megaquarry_core::store::QueueKind::Download,
+            &json!({"destination": "out/a.txt"}),
+        )
+        .unwrap();
+    let list = queue_list(home.path(), &fake);
+    assert!(
+        list.starts_with("    1  download  queued   out/a.txt"),
+        "{list:?}"
+    );
+}
+
+#[test]
+fn an_invalid_link_shows_what_links_look_like() {
+    let fake = start(None);
+    let home = tempfile::tempdir().unwrap();
+    for command in ["ls", "download"] {
+        let output = cli(home.path(), &fake)
+            .args([command, "notalink"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains(
+                "notalink: not a recognized MEGA link (links look like https://mega.nz/file/ID#KEY or https://mega.nz/folder/ID#KEY)"
+            ),
+            "{command}: {}",
+            stderr(&output)
+        );
+    }
 }

@@ -44,8 +44,9 @@ where
     D: DownloadTransport,
     U: UploadTransport,
 {
-    /// `session` is needed for uploads; `export_links` prints a public link
-    /// after each upload (`upload_generate_file_links`).
+    /// `session` is needed for uploads; `export_links` creates and prints a
+    /// public link after every upload (`upload_public_links`). An upload
+    /// entry with `"public_link": true` gets one either way.
     pub fn new(
         api: Arc<MegaApi<A>>,
         session: Option<Session>,
@@ -113,6 +114,7 @@ where
         else {
             return permanent("invalid upload entry: `path` and `parent` are required".into());
         };
+        let export_link = self.export_links || payload["public_link"].as_bool() == Some(true);
         let progress = Arc::new(match UploadCheckpoint::from_json(&payload["checkpoint"]) {
             Some(checkpoint) => UploadProgress::resuming(checkpoint),
             None => UploadProgress::default(),
@@ -151,7 +153,7 @@ where
         match result {
             Ok(uploaded) => {
                 let mut summary = format!("uploaded {} ({})", uploaded.name, uploaded.handle);
-                if self.export_links {
+                if export_link {
                     match crate::upload::export_link(&self.api, &uploaded.handle, &uploaded.key)
                         .await
                     {

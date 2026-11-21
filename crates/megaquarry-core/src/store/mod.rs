@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use lock::TransferLock;
-pub use settings::{KNOWN_SETTINGS, Settings};
+pub use settings::{
+    KNOWN_SETTINGS, SettingError, SettingKind, SettingSpec, Settings, setting_spec,
+    validate_setting,
+};
 pub use vault::{SALT_LEN, Vault};
 
 use crate::crypto::{b64url_decode, b64url_encode};

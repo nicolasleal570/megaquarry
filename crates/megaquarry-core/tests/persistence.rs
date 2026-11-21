@@ -2,7 +2,9 @@ use std::path::Path;
 
 use megaquarry_core::crypto::b64url_encode;
 use megaquarry_core::session::{Credentials, Session};
-use megaquarry_core::store::{QueueKind, Settings, Store, StoreError, Vault};
+use megaquarry_core::store::{
+    KNOWN_SETTINGS, QueueKind, Settings, Store, StoreError, Vault, validate_setting,
+};
 use serde_json::json;
 
 fn credentials(email: &str) -> Credentials {
@@ -49,10 +51,9 @@ fn settings_use_defaults_and_persist() {
         assert!(settings.multi_slot_downloads);
         assert_eq!(settings.download_speed_limit, None);
 
-        store.set_setting("default_slots_down", "12").unwrap();
-        store.set_setting("verify_down_file", "no").unwrap();
-        store.set_setting("limit_download_speed", "yes").unwrap();
-        store.set_setting("max_download_speed", "250").unwrap();
+        store.set_setting("download_connections", "12").unwrap();
+        store.set_setting("verify_downloads", "no").unwrap();
+        store.set_setting("download_speed_limit", "250").unwrap();
         store.set_setting("max_downloads", "not a number").unwrap();
     }
     let store = Store::open(&path).unwrap();
@@ -64,7 +65,7 @@ fn settings_use_defaults_and_persist() {
     // Unparsable values fall back to the default.
     assert_eq!(settings.max_downloads, 4);
     assert_eq!(
-        store.setting("verify_down_file").unwrap().as_deref(),
+        store.setting("verify_downloads").unwrap().as_deref(),
         Some("no")
     );
 }
@@ -72,7 +73,7 @@ fn settings_use_defaults_and_persist() {
 #[test]
 fn settings_clamp_out_of_range_values() {
     let store = Store::open_in_memory().unwrap();
-    store.set_setting("default_slots_down", "99").unwrap();
+    store.set_setting("download_connections", "99").unwrap();
     store.set_setting("max_uploads", "0").unwrap();
     let settings = Settings::load(&store).unwrap();
     assert_eq!(settings.download_workers, 20);
@@ -360,11 +361,125 @@ fn removing_a_missing_queue_entry_is_reported() {
 #[test]
 fn flags_are_true_only_for_yes() {
     let store = Store::open_in_memory().unwrap();
-    store.set_setting("verify_down_file", "maybe").unwrap();
-    store.set_setting("use_slots_down", "YES").unwrap();
+    store.set_setting("verify_downloads", "maybe").unwrap();
+    store.set_setting("upload_public_links", "YES").unwrap();
     let settings = Settings::load(&store).unwrap();
-    assert!(!settings.verify_downloads);
+    // Invalid flags fall back to their defaults.
+    assert!(settings.verify_downloads);
+    assert!(!settings.generate_upload_links);
+}
+
+#[test]
+fn defaults_match_the_documented_contract() {
+    let settings = Settings::default();
+    assert!(
+        !settings.generate_upload_links,
+        "uploads are private by default"
+    );
+    assert_eq!(settings.download_account, None);
+    assert_eq!(settings.upload_speed_limit, None);
+    let keys: Vec<_> = KNOWN_SETTINGS.iter().map(|s| s.key).collect();
+    assert_eq!(
+        keys,
+        [
+            "download_dir",
+            "download_connections",
+            "max_downloads",
+            "upload_connections",
+            "max_uploads",
+            "verify_downloads",
+            "download_speed_limit",
+            "upload_speed_limit",
+            "upload_public_links",
+            "download_account",
+            "app_key",
+            "egress_cooldown_fallback",
+            "egress_max_attempts",
+            "egress_reconnect_timeout",
+        ]
+    );
+}
+
+#[test]
+fn one_download_connection_is_single_connection_mode() {
+    let store = Store::open_in_memory().unwrap();
+    store.set_setting("download_connections", "1").unwrap();
+    let settings = Settings::load(&store).unwrap();
+    assert_eq!(settings.download_workers, 1);
     assert!(!settings.multi_slot_downloads);
+    assert!(Settings::default().multi_slot_downloads);
+}
+
+#[test]
+fn a_zero_speed_limit_is_unlimited() {
+    let store = Store::open_in_memory().unwrap();
+    store.set_setting("upload_speed_limit", "0").unwrap();
+    store.set_setting("download_speed_limit", "5").unwrap();
+    let settings = Settings::load(&store).unwrap();
+    assert_eq!(settings.upload_speed_limit, None);
+    assert_eq!(settings.download_speed_limit, Some(5 * 1024));
+}
+
+#[test]
+fn the_download_account_is_used_when_set() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .set_setting("download_account", "me@example.com")
+        .unwrap();
+    let settings = Settings::load(&store).unwrap();
+    assert_eq!(settings.download_account.as_deref(), Some("me@example.com"));
+}
+
+#[test]
+fn validation_names_the_allowed_values() {
+    assert_eq!(
+        validate_setting("max_downloads", "abc")
+            .unwrap_err()
+            .to_string(),
+        r#"max_downloads must be a number from 1 to 50 (got "abc")"#
+    );
+    assert_eq!(
+        validate_setting("max_downloads", "51")
+            .unwrap_err()
+            .to_string(),
+        r#"max_downloads must be a number from 1 to 50 (got "51")"#
+    );
+    assert_eq!(
+        validate_setting("verify_downloads", "true")
+            .unwrap_err()
+            .to_string(),
+        r#"verify_downloads must be yes or no (got "true")"#
+    );
+    assert_eq!(
+        validate_setting("nope", "1").unwrap_err().to_string(),
+        "unknown setting `nope` (see `megaquarry config list`)"
+    );
+    assert!(validate_setting("max_downloads", "50").is_ok());
+    assert!(validate_setting("verify_downloads", "no").is_ok());
+    assert!(validate_setting("download_speed_limit", "0").is_ok());
+    assert!(validate_setting("download_dir", "/tmp/x").is_ok());
+}
+
+#[test]
+fn bad_stored_values_are_reported_when_loading() {
+    let store = Store::open_in_memory().unwrap();
+    store.set_setting("max_downloads", "abc").unwrap();
+    store.set_setting("max_uploads", "500").unwrap();
+    store.set_setting("verify_downloads", "true").unwrap();
+    let (settings, warnings) = Settings::load_with_warnings(&store).unwrap();
+    assert_eq!(settings.max_downloads, 4);
+    assert_eq!(settings.max_uploads, 50);
+    assert!(settings.verify_downloads);
+    assert_eq!(
+        warnings,
+        [
+            r#"max_downloads must be a number from 1 to 50 (got "abc"); using 4"#,
+            r#"max_uploads must be a number from 1 to 50 (got "500"); using 50"#,
+            r#"verify_downloads must be yes or no (got "true"); using yes"#,
+        ]
+    );
+    let (_, none) = Settings::load_with_warnings(&Store::open_in_memory().unwrap()).unwrap();
+    assert!(none.is_empty());
 }
 
 #[cfg(unix)]

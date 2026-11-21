@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 megaquarry-core.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+indicatif.workspace = true
 rpassword.workspace = true
 dirs.workspace = true
 tokio = { workspace = true, features = ["signal"] }
