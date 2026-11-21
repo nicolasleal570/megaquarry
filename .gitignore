@@ -1,0 +1,7 @@
+/target
+
+# Exit IP rotation (compose.yaml): credentials, keys and local data
+/secrets/
+/gluetun/config.toml
+/data/
+/downloads/
