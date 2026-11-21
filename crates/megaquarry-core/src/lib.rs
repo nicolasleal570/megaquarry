@@ -5,6 +5,7 @@ pub mod download;
 pub mod egress;
 pub mod link;
 pub mod public;
+pub mod queue;
 pub mod session;
 pub mod store;
 pub mod throttle;
