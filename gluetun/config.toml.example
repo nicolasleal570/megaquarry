@@ -1,0 +1,12 @@
+# gluetun control server auth, mounted at /gluetun/auth/config.toml.
+# Copy to gluetun/config.toml (git-ignored) and put the same key that is in
+# secrets/gluetun_api_key. Every route not listed here answers 401.
+#
+# Without this file (or with no roles), gluetun v3.41.3 leaves the control
+# routes open without auth, and megaquarry refuses to start.
+
+[[roles]]
+name = "megaquarry"
+auth = "apikey"
+apikey = "REPLACE_WITH_API_KEY"
+routes = ["PUT /v1/vpn/status", "GET /v1/vpn/status", "GET /v1/publicip/ip"]

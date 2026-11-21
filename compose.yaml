@@ -1,0 +1,54 @@
+# megaquarry behind a rotating Surfshark exit IP (see README, "Exit IP rotation").
+#
+#   docker compose build
+#   docker compose run --rm megaquarry download <link>
+#   docker compose down            # stops the VPN
+#
+# megaquarry shares the `vpn` container's network: its only way out is the
+# tunnel, so it has no network at all while the tunnel is down.
+
+services:
+  vpn:
+    # Pinned: newer gluetun builds pick servers differently.
+    image: qmcgaw/gluetun:v3.41.3
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: surfshark
+      VPN_TYPE: openvpn
+      # Optional allowlist, e.g. "Netherlands,Germany". Empty means every country.
+      SERVER_COUNTRIES: ${SURFSHARK_COUNTRIES:-}
+      # Through OrbStack on macOS, full-size packets are lost in the tunnel and
+      # TLS handshakes hang (gluetun's healthcheck keeps restarting the VPN);
+      # a lower MSS fixes it. Set OPENVPN_MSSFIX= (empty) to disable.
+      OPENVPN_MSSFIX: ${OPENVPN_MSSFIX-1320}
+    secrets:
+      - openvpn_user
+      - openvpn_password
+    volumes:
+      # Control server auth: one API key role limited to what megaquarry uses.
+      - ./gluetun/config.toml:/gluetun/auth/config.toml:ro
+
+  megaquarry:
+    build: .
+    network_mode: service:vpn
+    depends_on:
+      - vpn
+    environment:
+      MEGAQUARRY_EGRESS_URL: http://127.0.0.1:8000
+      MEGAQUARRY_EGRESS_KEY_FILE: /run/secrets/gluetun_api_key
+    secrets:
+      - gluetun_api_key
+    volumes:
+      - ${MEGAQUARRY_DATA:-./data}:/data
+      - ${MEGAQUARRY_DOWNLOADS:-./downloads}:/downloads
+
+secrets:
+  openvpn_user:
+    file: ./secrets/openvpn_user
+  openvpn_password:
+    file: ./secrets/openvpn_password
+  gluetun_api_key:
+    file: ./secrets/gluetun_api_key
