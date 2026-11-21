@@ -8,3 +8,4 @@ pub mod public;
 pub mod session;
 pub mod store;
 pub mod throttle;
+pub mod upload;
